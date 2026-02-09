@@ -1,0 +1,238 @@
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+from typing import List
+
+import requests
+from fastapi import FastAPI
+from sqlalchemy import create_engine, Column, String, DateTime, Float, ForeignKey
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+
+# =====================================================
+# CONFIG — МЕНЯЕШЬ ТОЛЬКО ЭТО
+# =====================================================
+
+DODO_IS_BASE_URL = "https://api.dodois.io/dodopizza/ru"
+DODO_IS_TOKEN = "token nuzhen"
+BUSINESS_ID = "63d4829611ea45c8ae71394860a2481c"  # UUID бизнеса
+DODO_UNITS = [
+    "000d3a2480c3810e11e7bd751c665f09", "000d3a39d824a82e11e9dacc71d4cdf1", "220ece1af30a9f4611ed4958027557a6",
+    "4e11f854774dbaec11ef047aebf68f29", "000d3a240c719a8711e68aba13f80da9", "000d3a240c719a8711e68aba13f82835",
+    "000d3a240c719a8711e68aba13f88754", "11f0687c9f7eaf4cc4a22e455eeb7cd0", "11f0f84d949ddd7dcbdd2beaccd867b0",
+    "b2026196fb788c1e11ed3e2ed037e3e9", "000d3a240c719a8711e68aba13f9d0ee", "000d3a2155a180e411e79a1a1e9c37ac",
+    "000d3a21da51a81211e940067acb1091", "000d3a21da51a81211e94006b9ffe7fd", "000d3a2231e0a95211e8333cdd920305",
+    "000d3a2231e0a95211e8333d2d4504dd", "000d3a23b0dc80d911e6b24f4a188a9f", "000d3a258645a94d11e8006460706ab4",
+    "000d3a258645a95411e8333ca08c625f", "000d3a258645a95411e8333d19605def", "000d3a26b5b080de11e702b7926eda73",
+    "000d3a284715a95611e82dcf25c462c3", "000d3a284715a95811e8333ccf6cf1a0", "000d3a284715a95811e8333d3ee202d9",
+    "000d3a29ff6ba94b11e8f8724c1192bb", "000d3a39d824a81611e94006175e1abe", "000d3a39d824a82e11e9d84f7dc01968",
+    "000d3a39d824a82e11e9fc73824dc8fd", "000d3aac977bbb2d11ec4492cd4709f8", "000d3aac977bbb2d11ec82bbeeb26721",
+    "000d3abf84c3bb2e11ec44936eb36319", "11f0af27ab52d591e9b6f866b9da1d30", "2efce17d47699cfb11ecf0679180d18b",
+    "000d3a26b5b080f111e7c46eaf0afc18"
+]
+RETENTION_DAYS = 60  # Запросим только данные за последний день
+SYNC_INTERVAL_SECONDS = 24 * 60 * 60
+DATABASE_URL = "sqlite:///./supplies.db"
+
+# =====================================================
+# LOGGING
+# =====================================================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("dodo-sync")
+
+# =====================================================
+# DATABASE
+# =====================================================
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+class IncomingStockOrder(Base):
+    __tablename__ = "incoming_stock_orders"
+    id = Column(String, primary_key=True)
+    unitId = Column(String)
+    unitName = Column(String)
+    suppliedAtLocal = Column(DateTime(timezone=True))
+
+    items = relationship(
+        "StockItem",
+        back_populates="order",
+        cascade="all, delete-orphan",
+    )
+
+class StockItem(Base):
+    __tablename__ = "stock_items"
+    id = Column(String, primary_key=True)
+    orderId = Column(String, ForeignKey("incoming_stock_orders.id"))
+    name = Column(String)
+    quantity = Column(Float)
+    measurementUnit = Column(String)
+
+    order = relationship("IncomingStockOrder", back_populates="items")
+
+Base.metadata.create_all(bind=engine)
+
+# =====================================================
+# UTILS
+# =====================================================
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+def parse_dt(value: str) -> datetime:
+    return datetime.fromisoformat(value).replace(tzinfo=timezone.utc)
+
+def chunks(lst, size=30):
+    for i in range(0, len(lst), size):
+        yield lst[i:i + size]
+
+# =====================================================
+# DODO IS CLIENT
+# =====================================================
+
+class DodoISClient:
+    def __init__(self):
+        self.base_url = DODO_IS_BASE_URL
+        self.headers = {
+            "Authorization": f"Bearer {DODO_IS_TOKEN}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+
+    def get_supplies(self, from_date: datetime, to_date: datetime, unit: str) -> List[dict]:
+        skip = 0
+        result: List[dict] = []
+
+        while True:
+            logger.info(f"Fetching supplies for unit: {unit}, skip={skip}")
+
+            try:
+                from_date_str = from_date.strftime("%Y-%m-%dT%H:%M:%S")
+                to_date_str = to_date.strftime("%Y-%m-%dT%H:%M:%S")
+
+                response = requests.get(
+                    f"{self.base_url}/accounting/incoming-stock-items/by-supply",
+                    params={
+                        "from": from_date_str,
+                        "to": to_date_str,
+                        "units": unit,  # Используем только один UUID
+                        "skip": skip,
+                        "take": 10  # Ограничиваем количество данных
+                    },
+                    headers=self.headers,
+                )
+                response.raise_for_status()
+                data = response.json()
+
+                # Логируем URL запроса и параметры
+                logger.info(f"Request URL: {response.url}")
+                logger.info(f"Request Params: {response.request.body}")
+
+            except requests.HTTPError as e:
+                logger.error(f"HTTP Error: {e}")
+                logger.error(f"Response Text: {response.text}")  # Логируем текст ошибки
+                break
+            except Exception as e:
+                logger.exception("Unexpected error: %s", e)
+                break
+
+            batch = data.get("result", [])
+            if not batch:
+                break
+
+            result.extend(batch)
+
+            if data.get("isEndOfListReached", True):
+                break
+
+            skip += len(batch)
+
+        logger.info(f"Total supplies fetched for unit {unit}: {len(result)}")
+        return result
+
+# =====================================================
+# SYNC JOB
+# =====================================================
+
+def sync_job():
+    logger.info("===== SYNC JOB STARTED =====")
+
+    db = SessionLocal()
+    client = DodoISClient()
+
+    try:
+        # Используем список всех юнитов
+        for unit in DODO_UNITS:
+            # Получаем дату за последний день
+            to_date = now_utc()
+            from_date = to_date - timedelta(days=RETENTION_DAYS)
+
+            supplies = client.get_supplies(from_date, to_date, unit)
+
+            for supply in supplies:
+                supply_id = supply.get("supplyId")
+                if not supply_id:
+                    continue
+
+                exists = (
+                    db.query(IncomingStockOrder)
+                    .filter(IncomingStockOrder.id == supply_id)
+                    .first()
+                )
+                if exists:
+                    continue
+
+                order = IncomingStockOrder(
+                    id=supply_id,
+                    unitId=supply.get("unitId"),
+                    unitName=supply.get("unitName"),
+                    suppliedAtLocal=parse_dt(supply.get("suppliedAtLocal", now_utc().isoformat())),
+                )
+
+                for item in supply.get("items", []):
+                    order.items.append(
+                        StockItem(
+                            id=item.get("id"),
+                            name=item.get("name"),
+                            quantity=item.get("quantity", 0),
+                            measurementUnit=item.get("measurementUnit"),
+                        )
+                    )
+
+                db.add(order)
+
+        db.commit()
+
+        logger.info("===== SYNC FINISHED =====")
+
+    except Exception as e:
+        logger.exception("SYNC FAILED: %s", e)
+
+    finally:
+        db.close()
+
+
+# =====================================================
+# RUN BACKGROUND SYNC
+# =====================================================
+
+app = FastAPI()
+
+@app.on_event("startup")
+def on_startup():
+    logger.info("===== Application Started =====")
+    while True:
+        sync_job()
+        logger.info(f"Sleeping for {SYNC_INTERVAL_SECONDS} seconds...")
+        time.sleep(SYNC_INTERVAL_SECONDS)
+
+@app.get("/")
+def healthcheck():
+    return {"status": "ok"}
