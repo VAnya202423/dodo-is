@@ -1,0 +1,477 @@
+import logging
+import time
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List
+from contextlib import contextmanager
+import threading
+
+import requests
+from fastapi import FastAPI, Response
+from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from sqlalchemy import (
+    create_engine,
+    Column,
+    String,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    UniqueConstraint,
+)
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+
+# =====================================================
+# CONFIG
+# =====================================================
+DODO_IS_BASE_URL = "https://api.dodois.io/dodopizza/ru"
+DODO_IS_TOKEN = "secretni token"
+
+DODO_UNITS = [ "000d3a2480c3810e11e7bd751c665f09", "000d3a39d824a82e11e9dacc71d4cdf1", "220ece1af30a9f4611ed4958027557a6", "4e11f854774dbaec11ef047aebf68f29", "000d3a240c719a8711e68aba13f80da9", "000d3a240c719a8711e68aba13f82835", "000d3a240c719a8711e68aba13f88754", "11f0687c9f7eaf4cc4a22e455eeb7cd0", "11f0f84d949ddd7dcbdd2beaccd867b0", "b2026196fb788c1e11ed3e2ed037e3e9", "000d3a240c719a8711e68aba13f9d0ee", "000d3a2155a180e411e79a1a1e9c37ac", "000d3a21da51a81211e940067acb1091", "000d3a21da51a81211e94006b9ffe7fd", "000d3a2231e0a95211e8333cdd920305", "000d3a2231e0a95211e8333d2d4504dd", "000d3a23b0dc80d911e6b24f4a188a9f", "000d3a258645a94d11e8006460706ab4", "000d3a258645a95411e8333ca08c625f", "000d3a258645a95411e8333d19605def", "000d3a26b5b080de11e702b7926eda73", "000d3a284715a95611e82dcf25c462c3", "000d3a284715a95811e8333ccf6cf1a0", "000d3a284715a95811e8333d3ee202d9", "000d3a29ff6ba94b11e8f8724c1192bb", "000d3a39d824a81611e94006175e1abe", "000d3a39d824a82e11e9d84f7dc01968", "000d3a39d824a82e11e9fc73824dc8fd", "000d3aac977bbb2d11ec4492cd4709f8", "000d3aac977bbb2d11ec82bbeeb26721", "000d3abf84c3bb2e11ec44936eb36319", "11f0af27ab52d591e9b6f866b9da1d30", "2efce17d47699cfb11ecf0679180d18b", "000d3a26b5b080f111e7c46eaf0afc18", ]
+
+DATABASE_URL = "sqlite:///./supplies.db"
+SYNC_INTERVAL_SECONDS = 300
+RETENTION_DAYS = 30
+ENABLE_AUDIT = True
+
+# =====================================================
+# LOGGING
+# =====================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+logger = logging.getLogger("dodo-sync")
+
+# =====================================================
+# DATABASE
+# =====================================================
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False},
+)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+
+class SyncStatus(Base):
+    __tablename__ = "sync_status"
+    id = Column(Integer, primary_key=True)
+    last_sync = Column(DateTime(timezone=True), nullable=False)
+
+
+class IncomingStockOrder(Base):
+    __tablename__ = "incoming_stock_orders"
+
+    id = Column(String, primary_key=True)
+    unit_id = Column(String, nullable=False)
+    unit_name = Column(String, nullable=False)
+    supplied_at = Column(DateTime(timezone=True), nullable=False)
+
+    items = relationship(
+        "StockItem",
+        back_populates="order",
+        cascade="all, delete-orphan",
+    )
+
+
+class StockItem(Base):
+    __tablename__ = "stock_items"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    external_id = Column(String, nullable=False)
+    order_id = Column(
+        String,
+        ForeignKey("incoming_stock_orders.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name = Column(String, nullable=False)
+    quantity = Column(Float, nullable=False)
+    measurement_unit = Column(String, nullable=False)
+    total_price_with_vat = Column(Float)
+    total_price_without_vat = Column(Float)
+
+    order = relationship("IncomingStockOrder", back_populates="items")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "external_id",
+            "order_id",
+            name="uq_stockitem_external_order",
+        ),
+    )
+
+
+Base.metadata.create_all(bind=engine)
+
+# =====================================================
+# UTILS
+# =====================================================
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def parse_dt(value: str) -> datetime:
+    if value.endswith("Z"):
+        value = value.replace("Z", "+00:00")
+    return datetime.fromisoformat(value).astimezone(timezone.utc)
+
+
+@contextmanager
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+# =====================================================
+# DODO IS CLIENT
+# =====================================================
+class DodoISClient:
+    def __init__(self):
+        self.headers = {
+            "Authorization": f"Bearer {DODO_IS_TOKEN}",
+            "Accept": "application/json",
+        }
+
+    def get_supplies(
+        self,
+        from_date: datetime,
+        to_date: datetime,
+        unit_id: str,
+    ) -> List[Dict]:
+
+        skip = 0
+        result = []
+
+        while True:
+            try:
+                r = requests.get(
+                    f"{DODO_IS_BASE_URL}/accounting/incoming-stock-items/by-supply",
+                    headers=self.headers,
+                    params={
+                        "from": from_date.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "to": to_date.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "units": unit_id,
+                        "skip": skip,
+                        "take": 50,
+                    },
+                    timeout=60,
+                )
+                r.raise_for_status()
+            except requests.RequestException as e:
+                logger.error(f"API ERROR for unit {unit_id}: {e}")
+                break
+
+            data = r.json()
+            batch = data.get("result", [])
+
+            if not batch:
+                break
+
+            result.extend(batch)
+
+            if data.get("isEndOfListReached"):
+                break
+
+            skip += len(batch)
+
+        return result
+
+
+# =====================================================
+# SYNC
+# =====================================================
+def sync_supplies(db, client: DodoISClient):
+    logger.info("===== SYNC STARTED =====")
+
+    try:
+        status = db.query(SyncStatus).first()
+
+        if not status:
+            from_date = now_utc() - timedelta(days=RETENTION_DAYS)
+            status = SyncStatus(last_sync=from_date)
+            db.add(status)
+            db.commit()
+        else:
+            from_date = status.last_sync
+
+        to_date = now_utc()
+        logger.info(f"SYNC range: {from_date} → {to_date}")
+
+        for unit in DODO_UNITS:
+            supplies = client.get_supplies(from_date, to_date, unit)
+            logger.info(f"SYNC: {len(supplies)} supplies for unit {unit}")
+
+            for s in supplies:
+                order_id = s["incomingStockOrderId"]
+
+                order = db.get(IncomingStockOrder, order_id)
+                if not order:
+                    order = IncomingStockOrder(
+                        id=order_id,
+                        unit_id=s["unitId"],
+                        unit_name=s["unitName"],
+                        supplied_at=parse_dt(s["suppliedAtLocal"]),
+                    )
+                    db.add(order)
+
+                for item in s.get("stockItems", []):
+                    ext_id = item["id"]
+
+                    stock_item = (
+                        db.query(StockItem)
+                        .filter_by(order_id=order_id, external_id=ext_id)
+                        .first()
+                    )
+
+                    if stock_item:
+                        stock_item.quantity = item.get("quantity", 0)
+                        stock_item.total_price_with_vat = item.get("totalPriceWithVat")
+                        stock_item.total_price_without_vat = item.get("totalPriceWithoutVat")
+                    else:
+                        db.add(
+                            StockItem(
+                                external_id=ext_id,
+                                order=order,
+                                name=item["name"],
+                                quantity=item.get("quantity", 0),
+                                measurement_unit=item["measurementUnit"],
+                                total_price_with_vat=item.get("totalPriceWithVat"),
+                                total_price_without_vat=item.get("totalPriceWithoutVat"),
+                            )
+                        )
+
+        status.last_sync = to_date
+        db.commit()
+
+        cutoff = now_utc() - timedelta(days=RETENTION_DAYS)
+        old_orders = (
+            db.query(IncomingStockOrder)
+            .filter(IncomingStockOrder.supplied_at < cutoff)
+            .all()
+        )
+        for o in old_orders:
+            db.delete(o)
+
+        db.commit()
+
+    except Exception as e:
+        db.rollback()
+        logger.exception("SYNC FAILED: %s", e)
+
+    logger.info("===== SYNC FINISHED =====")
+
+
+# =====================================================
+# AUDIT
+# =====================================================
+def get_audit_data(db, client: DodoISClient):
+    """
+    Возвращает список отклонений для фронтенда
+    """
+    results = []
+    try:
+        db_orders = db.query(IncomingStockOrder).all()
+        if not db_orders:
+            return results
+
+        orders_by_unit: Dict[str, List[IncomingStockOrder]] = {}
+        for order in db_orders:
+            orders_by_unit.setdefault(order.unit_id, []).append(order)
+
+        from_date = now_utc() - timedelta(days=RETENTION_DAYS)
+        to_date = now_utc()
+
+        for unit_id, unit_orders in orders_by_unit.items():
+            api_supplies = client.get_supplies(from_date, to_date, unit_id)
+
+            api_map = {
+                s["incomingStockOrderId"]: s
+                for s in api_supplies
+            }
+
+            for order in unit_orders:
+                api_order = api_map.get(order.id)
+                if not api_order:
+                    continue
+
+                db_items = {
+                    i.external_id: i
+                    for i in order.items
+                }
+
+                for item in api_order.get("stockItems", []):
+                    db_item = db_items.get(item["id"])
+                    if not db_item:
+                        continue
+
+                    # считаем отклонение цены
+                    price = db_item.total_price_with_vat or 0
+                    avg_price = item.get("totalPriceWithVat") or 0
+                    deviation = 0
+                    if avg_price:
+                        deviation = (price - avg_price) / avg_price * 100
+
+                    results.append({
+                        "date": order.supplied_at.strftime("%d.%m.%Y"),
+                        "unit_name": order.unit_name,
+                        "product": db_item.name,
+                        "unit": db_item.measurement_unit,
+                        "price": price,
+                        "average": avg_price,
+                        "deviation": round(deviation, 1),
+                        "units_count": 1,
+                        "invoice": order.id,
+                    })
+    except Exception as e:
+        db.rollback()
+        logger.exception("AUDIT FAILED: %s", e)
+
+    return results
+
+
+# =====================================================
+# FASTAPI
+# =====================================================
+app = FastAPI()
+
+
+@app.on_event("startup")
+def startup():
+    def loop():
+        client = DodoISClient()
+        while True:
+            with get_db() as db:
+                sync_supplies(db, client)
+            time.sleep(SYNC_INTERVAL_SECONDS)
+
+    threading.Thread(target=loop, daemon=True).start()
+
+
+@app.get("/api/sync-status")
+def api_sync_status():
+    with get_db() as db:
+        status = db.query(SyncStatus).first()
+        return {"last_sync": status.last_sync.strftime("%d.%m.%Y %H:%M") if status else None}
+
+
+@app.get("/api/audit")
+def api_audit():
+    client = DodoISClient()
+    with get_db() as db:
+        data = get_audit_data(db, client)
+        return JSONResponse(data)
+
+
+@app.get("/")
+def index():
+    html_content = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Dodo IS | Антифрод поставок</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 20px; background: #f9f9f9; }
+header { background: #ff6600; color: white; padding: 10px 20px; font-size: 18px; }
+section { margin-top: 20px; }
+table { width: 100%; border-collapse: collapse; margin-top: 10px; background: white; }
+th, td { border: 1px solid #ccc; padding: 8px; text-align: left; }
+th { background: #f4f4f4; }
+.red { color: red; }
+.blue { color: blue; }
+.filter { margin-top: 10px; }
+button { padding: 5px 10px; margin-left: 5px; }
+</style>
+</head>
+<body>
+<header>Dodo IS | Антифрод поставок</header>
+<section>
+<p>Последнее обновление: <span id="last-sync">Загрузка...</span></p>
+<div class="filter">
+<label>Пиццерия:
+<select id="unit-filter">
+<option value="">Все пиццерии</option>
+</select>
+</label>
+<label>Дата с: <input type="date" id="date-from"></label>
+<label>Дата по: <input type="date" id="date-to"></label>
+<button onclick="applyFilter()">Применить</button>
+<button onclick="resetFilter()">Сбросить</button>
+</div>
+<table id="audit-table">
+<thead>
+<tr>
+<th>Дата</th><th>Пиццерия</th><th>Продукт</th><th>Ед. изм.</th><th>Цена</th><th>Средняя</th><th>Отклонение</th><th>Накладная</th>
+</tr>
+</thead>
+<tbody></tbody>
+</table>
+</section>
+<script>
+let auditData = [];
+
+async function loadData() {
+    const statusRes = await fetch('/api/sync-status');
+    const status = await statusRes.json();
+    document.getElementById('last-sync').textContent = status.last_sync || 'Неизвестно';
+
+    const auditRes = await fetch('/api/audit');
+    auditData = await auditRes.json();
+
+    const unitFilter = document.getElementById('unit-filter');
+    const units = [...new Set(auditData.map(d => d.unit_name))];
+    unitFilter.innerHTML = '<option value="">Все пиццерии</option>';
+    units.forEach(u => unitFilter.innerHTML += `<option value="${u}">${u}</option>`);
+
+    renderTable(auditData);
+}
+
+function renderTable(data) {
+    const tbody = document.querySelector('#audit-table tbody');
+    tbody.innerHTML = '';
+    data.forEach(d => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td>${d.date}</td>
+            <td>${d.unit_name}</td>
+            <td>${d.product}</td>
+            <td>${d.unit}</td>
+            <td>${d.price}</td>
+            <td>${d.average}</td>
+            <td class="${d.deviation>=0?'red':'blue'}">${d.deviation}%</td>
+            <td>${d.invoice}</td>
+        `;
+        tbody.appendChild(tr);
+    });
+}
+
+function applyFilter() {
+    const unit = document.getElementById('unit-filter').value;
+    const dateFrom = document.getElementById('date-from').value;
+    const dateTo = document.getElementById('date-to').value;
+
+    let filtered = auditData;
+    if (unit) filtered = filtered.filter(d => d.unit_name === unit);
+    if (dateFrom) filtered = filtered.filter(d => d.date >= dateFrom.split('-').reverse().join('.'));
+    if (dateTo) filtered = filtered.filter(d => d.date <= dateTo.split('-').reverse().join('.'));
+    renderTable(filtered);
+}
+
+function resetFilter() {
+    document.getElementById('unit-filter').value = '';
+    document.getElementById('date-from').value = '';
+    document.getElementById('date-to').value = '';
+    renderTable(auditData);
+}
+
+loadData();
+setInterval(loadData, 30000);
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html_content)
